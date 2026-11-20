@@ -1,0 +1,9 @@
+{
+  "_comment": "First matching rule wins. Matching is case-insensitive and every condition in a rule must hold. Copy to rules.json and edit.",
+  "rules": [
+    {"name": "Ninova", "from_name_contains": "Ninova", "folder": "Dersler"},
+    {"name": "GitHub", "from_addr_contains": "github.com", "folder": "Hesaplar"},
+    {"name": "Newsletters", "subject_contains": "bülten", "folder": "Bultenler"},
+    {"name": "Some shop's ads", "from_addr_contains": "newsletter@shop.example", "folder": "Trash"}
+  ]
+}

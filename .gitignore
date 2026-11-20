@@ -8,3 +8,4 @@ dist/
 venv/
 .env
 .DS_Store
+examples/mail-sorter/rules.json

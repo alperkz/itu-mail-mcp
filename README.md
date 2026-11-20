@@ -34,6 +34,10 @@ claude mcp add itu-mail -s user -e ITU_MAIL_USERNAME=<your-itu-username> -- itu-
 
 The second command asks for your İTÜ password and stores it in the Keychain. If `itu-mail-mcp` isn't on your PATH, use the full path (e.g. `~/Library/Python/3.11/bin/itu-mail-mcp`).
 
+## Extra: mail-sorter
+
+[`examples/mail-sorter`](examples/mail-sorter) uses the same IMAP client to move mail into folders by simple rules, either once or continuously with IMAP IDLE.
+
 ## Tests
 
 The tests use a fake IMAP connection, so they don't need an account or network.
