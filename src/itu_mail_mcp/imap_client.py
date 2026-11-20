@@ -10,6 +10,7 @@ import os
 import re
 import ssl
 import threading
+import time
 from contextlib import contextmanager
 from datetime import date
 from email import policy
@@ -418,3 +419,42 @@ class MailClient:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
         return {"path": str(target), "content_type": part.get_content_type(), "size": len(payload)}
+
+    # ------------------------------------------------------------- write
+
+    def set_read(self, uids: list[str], read: bool = True, folder: str = "INBOX") -> dict[str, Any]:
+        if not uids or not all(uid.isdigit() for uid in uids):
+            raise MailError("uids must be a non-empty list of numeric UIDs.")
+        with self.folder(folder, readonly=False) as conn:
+            status, data = conn.uid("STORE", ",".join(uids), "+FLAGS" if read else "-FLAGS", "(\\Seen)")
+        if status != "OK":
+            raise MailError(f"Could not update flags: {data}")
+        return {"folder": folder, "uids": uids, "read": read}
+
+    def save_draft(self, to: str, subject: str, body: str, cc: str | None = None) -> dict[str, Any]:
+        credentials = load_credentials()
+        sender = credentials.username if "@" in credentials.username else f"{credentials.username}@itu.edu.tr"
+        msg = EmailMessage()
+        msg["From"] = sender
+        msg["To"] = to
+        if cc:
+            msg["Cc"] = cc
+        msg["Subject"] = subject
+        msg["Date"] = email.utils.formatdate(localtime=True)
+        msg["Message-ID"] = email.utils.make_msgid(domain="itu.edu.tr")
+        msg.set_content(body)
+
+        drafts = next(
+            (f["name"] for f in self.list_folders() if "\\Drafts" in f["flags"]),
+            "Drafts",
+        )
+        with self.connect() as conn:
+            status, data = conn.append(
+                _quote(encode_mutf7(drafts)),
+                "(\\Draft \\Seen)",
+                imaplib.Time2Internaldate(time.time()),
+                msg.as_bytes(),
+            )
+        if status != "OK":
+            raise MailError(f"Could not save draft: {data}")
+        return {"saved_to": drafts, "to": to, "subject": subject, "note": "Not sent. Review and send it from webmail."}
