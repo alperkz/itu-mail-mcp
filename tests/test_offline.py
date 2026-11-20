@@ -63,6 +63,23 @@ class FakeConn:
         self.calls.append(("SUBSCRIBE", (mailbox,), None))
         return "OK", [b"done"]
 
+    def unsubscribe(self, mailbox):
+        self.calls.append(("UNSUBSCRIBE", (mailbox,), None))
+        return "OK", [b"done"]
+
+    message_count = 0
+
+    def status(self, mailbox, items):
+        return "OK", [b"%s (MESSAGES %d)" % (mailbox.encode(), self.message_count)]
+
+    def delete(self, mailbox):
+        self.calls.append(("DELETE", (mailbox,), None))
+        return "OK", [b"done"]
+
+    def rename(self, old, new):
+        self.calls.append(("RENAME", (old, new), None))
+        return "OK", [b"done"]
+
     def list(self):
         return "OK", [
             b'(\\HasNoChildren) "/" "INBOX"',
@@ -167,3 +184,41 @@ def test_move_reports_missing_and_uses_uid_move(client):
 def test_move_requires_existing_destination(client):
     with pytest.raises(MailError):
         client.move_messages(["12"], "INBOX", "Yok")
+
+
+def test_flag_and_unflag(client):
+    assert client.set_flagged(["12"])["flagged"] is True
+    client.set_flagged(["12"], flagged=False)
+    stores = [c[1] for c in client.conn.calls if c[0] == "STORE"]
+    assert stores == [("12", "+FLAGS", "(\\Flagged)"), ("12", "-FLAGS", "(\\Flagged)")]
+
+
+def test_flag_rejects_bad_uids(client):
+    with pytest.raises(MailError):
+        client.set_flagged(["abc"])
+
+
+def test_delete_empty_folder(client):
+    assert client.delete_folder("Çalı_ma") == {"deleted": "Çalı_ma"}
+    assert ("DELETE", ('"&AMc-al&ATE-_ma"',), None) in client.conn.calls
+
+
+def test_delete_refuses_non_empty_folder(client):
+    client.conn.message_count = 4
+    with pytest.raises(MailError, match="4 message"):
+        client.delete_folder("Çalı_ma")
+    assert not [c for c in client.conn.calls if c[0] == "DELETE"]
+
+
+def test_delete_and_rename_protect_system_folders(client):
+    for name in ["INBOX", "Drafts"]:
+        with pytest.raises(MailError):
+            client.delete_folder(name)
+        with pytest.raises(MailError):
+            client.rename_folder(name, "X")
+
+
+def test_rename_folder(client):
+    assert client.rename_folder("Çalı_ma", "Arşiv.Çalışma") == {"renamed": "Çalı_ma", "to": "Arşiv.Çalışma"}
+    with pytest.raises(MailError):
+        client.rename_folder("Çalı_ma", "Drafts")

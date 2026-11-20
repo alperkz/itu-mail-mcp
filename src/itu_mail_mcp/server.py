@@ -17,6 +17,8 @@ in Turkish (e-posta, mail, gelen kutusu, okunmamış, ek).
 
 It can also organise mail: create_folder (subfolders via parent) and move_message.
 Move mail only when the user asked for it; moved messages get new uids.
+rename_folder and delete_folder (empty folders only) need the user's go-ahead too.
+flag_message stars mail; use it only when the user explicitly says to flag or unflag.
 
 Typical flow: list_messages or search_messages to find mail, then get_message with
 the uid (and the same folder) to read it. Reading never marks mail as read.
@@ -113,6 +115,28 @@ def move_message(uids: list[str], destination: str, folder: str = "INBOX") -> An
     """Move messages by uid from `folder` to an existing `destination` folder. Moved
     messages get new uids in the destination. Reports uids that were not found."""
     return _run(client.move_messages, uids, folder, destination)
+
+
+@mcp.tool()
+def rename_folder(name: str, new_name: str) -> Any:
+    """Rename a folder, or move it under another one by giving the full new path (the
+    delimiter is "." on İTÜ, e.g. "Dersler.BLG 348E"). INBOX and system folders (Sent,
+    Drafts, Trash, ...) cannot be renamed."""
+    return _run(client.rename_folder, name, new_name)
+
+
+@mcp.tool()
+def delete_folder(name: str) -> Any:
+    """Delete a folder only if it is empty and has no subfolders; move its mail out first.
+    INBOX and system folders (Sent, Drafts, Trash, ...) cannot be deleted."""
+    return _run(client.delete_folder, name)
+
+
+@mcp.tool()
+def flag_message(uids: list[str], flagged: bool = True, folder: str = "INBOX") -> Any:
+    """Flag (star) messages, or unflag them with flagged=false. Only call this when the user
+    explicitly asks to flag or unflag specific mail; never flag on your own judgement."""
+    return _run(client.set_flagged, uids, flagged, folder)
 
 
 if WRITE_ENABLED:

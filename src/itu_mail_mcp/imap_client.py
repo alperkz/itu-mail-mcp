@@ -27,6 +27,8 @@ IMAP_HOST = "imap.itu.edu.tr"
 IMAP_PORT = 993
 DEFAULT_TIMEOUT = 30
 HEADER_FIELDS = "FROM TO CC SUBJECT DATE MESSAGE-ID"
+# Folders the mail clients rely on; they are never renamed or deleted.
+SPECIAL_USE_FLAGS = {"\\Sent", "\\Drafts", "\\Trash", "\\Junk", "\\Archive", "\\All"}
 
 
 class MailError(RuntimeError):
@@ -450,6 +452,53 @@ class MailClient:
             conn.subscribe(mailbox)
         return {"folder": full_name, "created": True, "delimiter": delimiter}
 
+    def _check_changeable(self, name: str, folders: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        folder = folders.get(name)
+        if folder is None:
+            raise MailError(f"Folder {name!r} does not exist.")
+        special = [flag for flag in folder["flags"] if flag in SPECIAL_USE_FLAGS]
+        if name.upper() == "INBOX" or special:
+            raise MailError(f"{name!r} is a system folder ({', '.join(special) or 'INBOX'}); leave it as is.")
+        return folder
+
+    def delete_folder(self, name: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            folders = self._folder_index(conn)
+            folder = self._check_changeable(name, folders)
+            delimiter = folder["delimiter"] or "."
+            children = [f for f in folders if f.startswith(name + delimiter)]
+            if children:
+                raise MailError(f"{name!r} has subfolders ({', '.join(children)}); delete or move them first.")
+            mailbox = _quote(encode_mutf7(name))
+            status, data = conn.status(mailbox, "(MESSAGES)")
+            if status != "OK":
+                raise MailError(f"Cannot read folder {name!r}: {data}")
+            count = int(dict(re.findall(rb"(MESSAGES) (\d+)", data[0])).get(b"MESSAGES", 0))
+            if count:
+                raise MailError(f"{name!r} still holds {count} message(s); only empty folders can be deleted.")
+            conn.unsubscribe(mailbox)
+            status, data = conn.delete(mailbox)
+            if status != "OK":
+                raise MailError(f"Could not delete folder {name!r}: {data}")
+        return {"deleted": name}
+
+    def rename_folder(self, name: str, new_name: str) -> dict[str, Any]:
+        new_name = new_name.strip()
+        if not new_name:
+            raise MailError("New folder name must not be empty.")
+        with self.connect() as conn:
+            folders = self._folder_index(conn)
+            self._check_changeable(name, folders)
+            if new_name in folders:
+                raise MailError(f"A folder named {new_name!r} already exists.")
+            old_box, new_box = _quote(encode_mutf7(name)), _quote(encode_mutf7(new_name))
+            status, data = conn.rename(old_box, new_box)
+            if status != "OK":
+                raise MailError(f"Could not rename {name!r} to {new_name!r}: {data}")
+            conn.unsubscribe(old_box)
+            conn.subscribe(new_box)
+        return {"renamed": name, "to": new_name}
+
     def move_messages(self, uids: list[str], source: str, destination: str) -> dict[str, Any]:
         if not uids or not all(uid.isdigit() for uid in uids):
             raise MailError("uids must be a non-empty list of numeric UIDs.")
@@ -493,6 +542,15 @@ class MailClient:
         if status != "OK":
             raise MailError(f"Could not update flags: {data}")
         return {"folder": folder, "uids": uids, "read": read}
+
+    def set_flagged(self, uids: list[str], flagged: bool = True, folder: str = "INBOX") -> dict[str, Any]:
+        if not uids or not all(uid.isdigit() for uid in uids):
+            raise MailError("uids must be a non-empty list of numeric UIDs.")
+        with self.folder(folder, readonly=False) as conn:
+            status, data = conn.uid("STORE", ",".join(uids), "+FLAGS" if flagged else "-FLAGS", "(\\Flagged)")
+        if status != "OK":
+            raise MailError(f"Could not update flags: {data}")
+        return {"folder": folder, "uids": uids, "flagged": flagged}
 
     def save_draft(self, to: str, subject: str, body: str, cc: str | None = None) -> dict[str, Any]:
         credentials = load_credentials()
