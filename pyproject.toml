@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "itu-mail-mcp"
+version = "0.1.0"
+description = "MCP server for İTÜ e-mail (imap.itu.edu.tr): list, search and read mail, download attachments, create folders and move mail."
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.2", "beautifulsoup4"]
+
+[project.scripts]
+itu-mail-mcp = "itu_mail_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,420 @@
+"""Thin IMAP client for İTÜ mail (Dovecot at imap.itu.edu.tr)."""
+
+from __future__ import annotations
+
+import base64
+import email
+import email.utils
+import imaplib
+import os
+import re
+import ssl
+import threading
+from contextlib import contextmanager
+from datetime import date
+from email import policy
+from email.message import EmailMessage
+from pathlib import Path
+from typing import Any, Iterator
+
+from bs4 import BeautifulSoup
+
+from .credentials import load_credentials
+
+# Host is fixed on purpose: credentials are only ever sent to İTÜ's IMAP server.
+IMAP_HOST = "imap.itu.edu.tr"
+IMAP_PORT = 993
+DEFAULT_TIMEOUT = 30
+HEADER_FIELDS = "FROM TO CC SUBJECT DATE MESSAGE-ID"
+
+
+class MailError(RuntimeError):
+    pass
+
+
+# --------------------------------------------------------------- modified UTF-7
+
+
+def decode_mutf7(name: str) -> str:
+    """Decode an IMAP folder name (RFC 3501 modified UTF-7), e.g. 'Gelen &AT8-...'."""
+
+    def _decode(match: re.Match[str]) -> str:
+        chunk = match.group(1)
+        if not chunk:
+            return "&"
+        chunk = chunk.replace(",", "/")
+        chunk += "=" * (-len(chunk) % 4)
+        return base64.b64decode(chunk).decode("utf-16-be")
+
+    return re.sub(r"&([^-]*)-", _decode, name)
+
+
+def encode_mutf7(name: str) -> str:
+    out: list[str] = []
+    buffer: list[str] = []
+
+    def _flush() -> None:
+        if buffer:
+            raw = "".join(buffer).encode("utf-16-be")
+            out.append("&" + base64.b64encode(raw).decode().rstrip("=").replace("/", ",") + "-")
+            buffer.clear()
+
+    for char in name:
+        if 0x20 <= ord(char) <= 0x7E:
+            _flush()
+            out.append("&-" if char == "&" else char)
+        else:
+            buffer.append(char)
+    _flush()
+    return "".join(out)
+
+
+def _quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _imap_date(value: str) -> str:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise MailError(f"Dates must be YYYY-MM-DD, got {value!r}.") from exc
+    months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+    return f"{parsed.day:02d}-{months[parsed.month - 1]}-{parsed.year}"
+
+
+# ------------------------------------------------------------------ parsing
+
+
+_LIST_RE = re.compile(rb'\((?P<flags>[^)]*)\) (?P<delim>"[^"]*"|NIL) (?P<name>.*)$')
+
+
+def _parse_list_line(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, tuple):  # name sent as a literal
+        meta, name_bytes = item
+        match = _LIST_RE.match(meta)
+        raw_name = name_bytes.decode()
+    else:
+        if item is None:
+            return None
+        match = _LIST_RE.match(item)
+        raw_name = match.group("name").decode() if match else ""
+    if not match:
+        return None
+    if raw_name.startswith('"') and raw_name.endswith('"'):
+        raw_name = raw_name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    flags = match.group("flags").decode().split()
+    delim = match.group("delim").decode()
+    return {
+        "name": decode_mutf7(raw_name),
+        "flags": flags,
+        "delimiter": None if delim == "NIL" else delim[1:-1],
+    }
+
+
+def _group_fetch(data: list[Any]) -> list[tuple[bytes, bytes]]:
+    """Turn imaplib FETCH output into (metadata, literal) pairs.
+
+    Metadata after the literal (e.g. a trailing ' FLAGS (...))') is appended to the
+    pair's metadata so UID/FLAGS are found wherever the server put them.
+    """
+    records: list[list[bytes]] = []
+    for item in data:
+        if isinstance(item, tuple):
+            records.append([item[0], item[1]])
+        elif isinstance(item, bytes) and records:
+            records[-1][0] += b" " + item
+    return [(meta, literal) for meta, literal in records]
+
+
+def _meta_value(meta: bytes, key: bytes) -> str | None:
+    match = re.search(key + rb" (\d+)", meta)
+    return match.group(1).decode() if match else None
+
+
+def _meta_flags(meta: bytes) -> list[str]:
+    match = re.search(rb"FLAGS \(([^)]*)\)", meta)
+    return match.group(1).decode().split() if match else []
+
+
+def _header(msg: EmailMessage, name: str) -> str:
+    try:
+        value = msg.get(name)
+    except Exception:  # malformed header
+        value = msg.get_all(name, failobj=[""])[0] if name in msg else ""
+    # Folded headers (e.g. "Message-ID:\r\n <...>") keep the fold's leading space.
+    return str(value).strip() if value is not None else ""
+
+
+def _iso_date(raw: str) -> str | None:
+    if not raw:
+        return None
+    try:
+        return email.utils.parsedate_to_datetime(raw).isoformat()
+    except (TypeError, ValueError):
+        return raw
+
+
+def _html_to_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "head"]):
+        tag.decompose()
+    text = soup.get_text("\n")
+    return re.sub(r"\n\s*\n+", "\n\n", text).strip()
+
+
+def _summary(uid: str, flags: list[str], size: str | None, header_bytes: bytes) -> dict[str, Any]:
+    msg = email.message_from_bytes(header_bytes, policy=policy.default)
+    return {
+        "uid": uid,
+        "date": _iso_date(_header(msg, "Date")),
+        "from": _header(msg, "From"),
+        "to": _header(msg, "To"),
+        "cc": _header(msg, "Cc") or None,
+        "subject": _header(msg, "Subject"),
+        "unread": "\\Seen" not in flags,
+        "flagged": "\\Flagged" in flags,
+        "size": int(size) if size else None,
+    }
+
+
+def _safe_filename(name: str | None, fallback: str) -> str:
+    cleaned = Path(name or "").name.strip().replace("\x00", "")
+    cleaned = re.sub(r"[\\/:*?\"<>|\r\n\t]", "_", cleaned).lstrip(".")
+    return cleaned[:150] or fallback
+
+
+# ------------------------------------------------------------------- client
+
+
+class MailClient:
+    def __init__(self, state_dir: Path | None = None) -> None:
+        self.state_dir = Path(
+            state_dir or os.getenv("ITU_MAIL_STATE_DIR", "~/.itu_mail_state")
+        ).expanduser()
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def connect(self) -> Iterator[imaplib.IMAP4_SSL]:
+        credentials = load_credentials()
+        with self._lock:
+            conn = imaplib.IMAP4_SSL(
+                IMAP_HOST,
+                IMAP_PORT,
+                ssl_context=ssl.create_default_context(),
+                timeout=DEFAULT_TIMEOUT,
+            )
+            try:
+                try:
+                    conn.login(credentials.username, credentials.password)
+                except imaplib.IMAP4.error as exc:
+                    raise MailError(f"İTÜ mail login failed: {exc}") from exc
+                yield conn
+            finally:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+
+    @contextmanager
+    def folder(self, name: str, readonly: bool = True) -> Iterator[imaplib.IMAP4_SSL]:
+        with self.connect() as conn:
+            status, data = conn.select(_quote(encode_mutf7(name)), readonly=readonly)
+            if status != "OK":
+                raise MailError(f"Cannot open folder {name!r}: {data}")
+            yield conn
+
+    # -------------------------------------------------------------- read
+
+    def status(self) -> dict[str, Any]:
+        credentials = load_credentials()
+        with self.connect() as conn:
+            _, data = conn.status("INBOX", "(MESSAGES UNSEEN)")
+        counts = dict(re.findall(rb"(MESSAGES|UNSEEN) (\d+)", data[0]))
+        return {
+            "authenticated": True,
+            "host": IMAP_HOST,
+            "username": credentials.username,
+            "password_source": credentials.source,
+            "inbox_messages": int(counts.get(b"MESSAGES", 0)),
+            "inbox_unread": int(counts.get(b"UNSEEN", 0)),
+        }
+
+    def list_folders(self, include_counts: bool = False) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            _, data = conn.list()
+            folders = [f for f in (_parse_list_line(item) for item in data) if f]
+            for folder in folders:
+                folder.pop("delimiter", None)
+            if include_counts:
+                for folder in folders:
+                    if "\\Noselect" in folder["flags"]:
+                        continue
+                    status, info = conn.status(
+                        _quote(encode_mutf7(folder["name"])), "(MESSAGES UNSEEN)"
+                    )
+                    if status == "OK":
+                        counts = dict(re.findall(rb"(MESSAGES|UNSEEN) (\d+)", info[0]))
+                        folder["messages"] = int(counts.get(b"MESSAGES", 0))
+                        folder["unread"] = int(counts.get(b"UNSEEN", 0))
+        return folders
+
+    def _fetch_summaries(self, conn: imaplib.IMAP4_SSL, uids: list[str]) -> list[dict[str, Any]]:
+        if not uids:
+            return []
+        _, data = conn.uid(
+            "FETCH",
+            ",".join(uids),
+            f"(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS ({HEADER_FIELDS})])",
+        )
+        by_uid = {}
+        for meta, literal in _group_fetch(data):
+            uid = _meta_value(meta, b"UID")
+            if uid:
+                by_uid[uid] = _summary(uid, _meta_flags(meta), _meta_value(meta, b"RFC822.SIZE"), literal)
+        return [by_uid[uid] for uid in uids if uid in by_uid]
+
+    def _search_uids(self, conn: imaplib.IMAP4_SSL, criteria: list[str], literal: str | None) -> list[str]:
+        args = ["CHARSET", "UTF-8", *criteria] if literal is not None else criteria
+        if literal is not None:
+            conn.literal = literal.encode("utf-8")
+        status, data = conn.uid("SEARCH", *args)
+        if status != "OK":
+            raise MailError(f"Search failed: {data}")
+        return data[0].decode().split() if data and data[0] else []
+
+    def list_messages(
+        self, folder: str = "INBOX", limit: int = 20, offset: int = 0, unread_only: bool = False
+    ) -> dict[str, Any]:
+        limit = max(1, min(limit, 100))
+        with self.folder(folder) as conn:
+            uids = self._search_uids(conn, ["UNSEEN" if unread_only else "ALL"], None)
+            uids.sort(key=int, reverse=True)
+            page = uids[offset : offset + limit]
+            messages = self._fetch_summaries(conn, page)
+        return {"folder": folder, "total": len(uids), "offset": offset, "messages": messages}
+
+    def search(
+        self,
+        folder: str = "INBOX",
+        text: str | None = None,
+        from_: str | None = None,
+        to: str | None = None,
+        subject: str | None = None,
+        since: str | None = None,
+        before: str | None = None,
+        unread_only: bool = False,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        limit = max(1, min(limit, 100))
+        criteria: list[str] = []
+        if unread_only:
+            criteria.append("UNSEEN")
+        if since:
+            criteria += ["SINCE", _imap_date(since)]
+        if before:
+            criteria += ["BEFORE", _imap_date(before)]
+
+        # imaplib sends at most one literal, and only at the end of the command,
+        # so the single non-ASCII value (common with Turkish text) goes last.
+        literal: str | None = None
+        text_fields = [("TEXT", text), ("FROM", from_), ("TO", to), ("SUBJECT", subject)]
+        for key, value in text_fields:
+            if not value:
+                continue
+            if value.isascii():
+                criteria += [key, _quote(value)]
+            elif literal is None:
+                literal_key, literal = key, value
+            else:
+                raise MailError(
+                    "Only one search field may contain non-ASCII (e.g. Turkish) characters; "
+                    "narrow the others to ASCII or search in two steps."
+                )
+        if literal is not None:
+            criteria.append(literal_key)
+        elif any(value for _, value in text_fields):
+            criteria = ["CHARSET", "UTF-8", *criteria]
+        if not criteria:
+            criteria = ["ALL"]
+
+        with self.folder(folder) as conn:
+            uids = self._search_uids(conn, criteria, literal)
+            uids.sort(key=int, reverse=True)
+            messages = self._fetch_summaries(conn, uids[:limit])
+        return {"folder": folder, "total_matches": len(uids), "messages": messages}
+
+    def _fetch_message(self, conn: imaplib.IMAP4_SSL, uid: str) -> tuple[EmailMessage, list[str]]:
+        if not uid.isdigit():
+            raise MailError("uid must be numeric.")
+        _, data = conn.uid("FETCH", uid, "(UID FLAGS BODY.PEEK[])")
+        records = _group_fetch(data)
+        if not records:
+            raise MailError(f"No message with UID {uid} in this folder.")
+        meta, raw = records[0]
+        return email.message_from_bytes(raw, policy=policy.default), _meta_flags(meta)
+
+    def get_message(self, uid: str, folder: str = "INBOX", max_chars: int = 20000) -> dict[str, Any]:
+        with self.folder(folder) as conn:
+            msg, flags = self._fetch_message(conn, uid)
+
+        body_part = msg.get_body(preferencelist=("plain", "html"))
+        body, body_format = "", None
+        if body_part is not None:
+            try:
+                content = body_part.get_content()
+            except (LookupError, UnicodeDecodeError):
+                content = body_part.get_payload(decode=True).decode("utf-8", "replace")
+            if body_part.get_content_subtype() == "html":
+                body, body_format = _html_to_text(content), "html→text"
+            else:
+                body, body_format = content.strip(), "plain"
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
+        truncated = len(body) > max_chars
+
+        return {
+            "uid": uid,
+            "folder": folder,
+            "date": _iso_date(_header(msg, "Date")),
+            "from": _header(msg, "From"),
+            "to": _header(msg, "To"),
+            "cc": _header(msg, "Cc") or None,
+            "reply_to": _header(msg, "Reply-To") or None,
+            "subject": _header(msg, "Subject"),
+            "message_id": _header(msg, "Message-ID") or None,
+            "unread": "\\Seen" not in flags,
+            "body_format": body_format,
+            "body": body[:max_chars],
+            "truncated": truncated,
+            "attachments": [
+                {
+                    "index": index,
+                    "filename": part.get_filename(),
+                    "content_type": part.get_content_type(),
+                    "size": len(part.get_payload(decode=True) or b""),
+                }
+                for index, part in enumerate(msg.iter_attachments())
+            ],
+        }
+
+    def download_attachment(self, uid: str, index: int, folder: str = "INBOX") -> dict[str, Any]:
+        with self.folder(folder) as conn:
+            msg, _ = self._fetch_message(conn, uid)
+        attachments = list(msg.iter_attachments())
+        if not 0 <= index < len(attachments):
+            raise MailError(f"Message {uid} has {len(attachments)} attachment(s); index {index} is invalid.")
+        part = attachments[index]
+        payload = part.get_payload(decode=True) or b""
+
+        # Always under the state dir: a mail cannot steer a write elsewhere on disk.
+        target_dir = self.state_dir / "attachments" / uid
+        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        filename = _safe_filename(part.get_filename(), f"attachment-{index}")
+        target = target_dir / filename
+        stem, suffix, n = target.stem, target.suffix, 1
+        while target.exists():
+            target = target_dir / f"{stem} ({n}){suffix}"
+            n += 1
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        return {"path": str(target), "content_type": part.get_content_type(), "size": len(payload)}
