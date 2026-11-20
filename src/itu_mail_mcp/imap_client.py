@@ -422,6 +422,69 @@ class MailClient:
 
     # ------------------------------------------------------------- write
 
+    def _folder_index(self, conn: imaplib.IMAP4_SSL) -> dict[str, dict[str, Any]]:
+        _, data = conn.list()
+        return {f["name"]: f for f in (_parse_list_line(item) for item in data) if f}
+
+    def create_folder(self, name: str, parent: str | None = None) -> dict[str, Any]:
+        name = name.strip()
+        if not name:
+            raise MailError("Folder name must not be empty.")
+        with self.connect() as conn:
+            folders = self._folder_index(conn)
+            delimiter = next((f["delimiter"] for f in folders.values() if f["delimiter"]), "/")
+            if parent:
+                if parent not in folders:
+                    raise MailError(f"Parent folder {parent!r} does not exist.")
+                if delimiter in name:
+                    raise MailError(f"With parent set, name must not contain {delimiter!r}.")
+                full_name = f"{parent}{delimiter}{name}"
+            else:
+                full_name = name
+            if full_name in folders:
+                return {"folder": full_name, "created": False, "note": "Folder already exists."}
+            mailbox = _quote(encode_mutf7(full_name))
+            status, data = conn.create(mailbox)
+            if status != "OK":
+                raise MailError(f"Could not create folder {full_name!r}: {data}")
+            conn.subscribe(mailbox)
+        return {"folder": full_name, "created": True, "delimiter": delimiter}
+
+    def move_messages(self, uids: list[str], source: str, destination: str) -> dict[str, Any]:
+        if not uids or not all(uid.isdigit() for uid in uids):
+            raise MailError("uids must be a non-empty list of numeric UIDs.")
+        if source == destination:
+            raise MailError("Source and destination folders are the same.")
+        with self.connect() as conn:
+            if destination not in self._folder_index(conn):
+                raise MailError(f"Destination folder {destination!r} does not exist; create it first.")
+            status, data = conn.select(_quote(encode_mutf7(source)), readonly=False)
+            if status != "OK":
+                raise MailError(f"Cannot open folder {source!r}: {data}")
+            present = set(self._search_uids(conn, ["UID", ",".join(uids)], None))
+            found = [uid for uid in uids if uid in present]
+            missing = [uid for uid in uids if uid not in present]
+            # imaplib keeps the pre-login list; MOVE/UIDPLUS are only advertised after login.
+            _, caps = conn.capability()
+            capabilities = set(caps[-1].decode().upper().split()) if caps and caps[-1] else set()
+            if found:
+                target = _quote(encode_mutf7(destination))
+                uid_set = ",".join(found)
+                if "MOVE" in capabilities:
+                    status, data = conn.uid("MOVE", uid_set, target)
+                    if status != "OK":
+                        raise MailError(f"Move failed: {data}")
+                elif "UIDPLUS" in capabilities:
+                    # UID EXPUNGE removes only these messages, never other \Deleted mail.
+                    status, data = conn.uid("COPY", uid_set, target)
+                    if status != "OK":
+                        raise MailError(f"Copy failed: {data}")
+                    conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
+                    conn.uid("EXPUNGE", uid_set)
+                else:
+                    raise MailError("Server supports neither MOVE nor UIDPLUS; cannot move safely.")
+        return {"from": source, "to": destination, "moved": found, "not_found": missing}
+
     def set_read(self, uids: list[str], read: bool = True, folder: str = "INBOX") -> dict[str, Any]:
         if not uids or not all(uid.isdigit() for uid in uids):
             raise MailError("uids must be a non-empty list of numeric UIDs.")

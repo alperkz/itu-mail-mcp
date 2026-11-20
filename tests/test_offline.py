@@ -46,9 +46,22 @@ class FakeConn:
             ]
         return "OK", [None]
 
+    capabilities = ("IMAP4REV1",)  # pre-login list, as imaplib keeps it
+
+    def capability(self):
+        return "OK", [b"IMAP4rev1 UIDPLUS MOVE"]
+
     def select(self, mailbox, readonly=True):
         self.calls.append(("SELECT", (mailbox, readonly), None))
         return "OK", [b"3"]
+
+    def create(self, mailbox):
+        self.calls.append(("CREATE", (mailbox,), None))
+        return "OK", [b"done"]
+
+    def subscribe(self, mailbox):
+        self.calls.append(("SUBSCRIBE", (mailbox,), None))
+        return "OK", [b"done"]
 
     def list(self):
         return "OK", [
@@ -125,3 +138,32 @@ def test_download_attachment_stays_in_state_dir(client, tmp_path):
 
 def test_html_to_text():
     assert imap_client._html_to_text("<p>a</p><script>bad()</script><p>b</p>") == "a\nb"
+
+
+def test_create_subfolder_uses_server_delimiter(client):
+    result = client.create_folder("Ödevler", parent="INBOX")
+    assert result == {"folder": "INBOX/Ödevler", "created": True, "delimiter": "/"}
+    assert client.conn.calls[0] == ("CREATE", ('"INBOX/&ANY-devler"',), None)
+
+
+def test_create_existing_folder_is_noop(client):
+    assert client.create_folder("Drafts")["created"] is False
+    assert not client.conn.calls
+
+
+def test_create_folder_rejects_unknown_parent(client):
+    with pytest.raises(MailError):
+        client.create_folder("X", parent="Yok")
+
+
+def test_move_reports_missing_and_uses_uid_move(client):
+    result = client.move_messages(["7", "12", "99"], "INBOX", "Drafts")
+    assert result["moved"] == ["7", "12"]
+    assert result["not_found"] == ["99"]
+    move = [c for c in client.conn.calls if c[0] == "MOVE"]
+    assert move[0][1] == ("7,12", '"Drafts"')
+
+
+def test_move_requires_existing_destination(client):
+    with pytest.raises(MailError):
+        client.move_messages(["12"], "INBOX", "Yok")

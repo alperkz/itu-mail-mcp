@@ -15,6 +15,9 @@ This connector reads the user's own İTÜ e-mail account (…@itu.edu.tr) over I
 folders, message lists, search, full messages and attachments. Questions are often
 in Turkish (e-posta, mail, gelen kutusu, okunmamış, ek).
 
+It can also organise mail: create_folder (subfolders via parent) and move_message.
+Move mail only when the user asked for it; moved messages get new uids.
+
 Typical flow: list_messages or search_messages to find mail, then get_message with
 the uid (and the same folder) to read it. Reading never marks mail as read.
 
@@ -96,6 +99,20 @@ def download_attachment(uid: str, index: int, folder: str = "INBOX") -> Any:
     """Save attachment number `index` (from get_message) under ~/.itu_mail_state/attachments
     and return its local path."""
     return _run(client.download_attachment, uid, index, folder)
+
+
+@mcp.tool()
+def create_folder(name: str, parent: str | None = None) -> Any:
+    """Create a mail folder. With parent (e.g. "INBOX" or "Dersler"), it is created as a
+    subfolder. Does nothing if the folder already exists."""
+    return _run(client.create_folder, name, parent)
+
+
+@mcp.tool()
+def move_message(uids: list[str], destination: str, folder: str = "INBOX") -> Any:
+    """Move messages by uid from `folder` to an existing `destination` folder. Moved
+    messages get new uids in the destination. Reports uids that were not found."""
+    return _run(client.move_messages, uids, folder, destination)
 
 
 if WRITE_ENABLED:
