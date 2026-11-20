@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import imaplib
 import os
 from typing import Any
 
@@ -39,6 +40,8 @@ def _run(fn, *args, **kwargs) -> Any:
         return fn(*args, **kwargs)
     except (MailError, CredentialError) as exc:
         return {"error": str(exc)}
+    except (OSError, imaplib.IMAP4.error) as exc:  # dropped connection, timeout, server abort
+        return {"error": f"IMAP connection problem: {exc}"}
 
 
 @mcp.tool()

@@ -20,7 +20,7 @@ from typing import Any, Iterator
 
 from bs4 import BeautifulSoup
 
-from .credentials import load_credentials
+from .credentials import Credentials, load_credentials
 
 # Host is fixed on purpose: credentials are only ever sent to İTÜ's IMAP server.
 IMAP_HOST = "imap.itu.edu.tr"
@@ -197,15 +197,18 @@ class MailClient:
         self._lock = threading.Lock()
 
     @contextmanager
-    def connect(self) -> Iterator[imaplib.IMAP4_SSL]:
-        credentials = load_credentials()
+    def connect(self, credentials: Credentials | None = None) -> Iterator[imaplib.IMAP4_SSL]:
+        credentials = credentials or load_credentials()
         with self._lock:
-            conn = imaplib.IMAP4_SSL(
-                IMAP_HOST,
-                IMAP_PORT,
-                ssl_context=ssl.create_default_context(),
-                timeout=DEFAULT_TIMEOUT,
-            )
+            try:
+                conn = imaplib.IMAP4_SSL(
+                    IMAP_HOST,
+                    IMAP_PORT,
+                    ssl_context=ssl.create_default_context(),
+                    timeout=DEFAULT_TIMEOUT,
+                )
+            except OSError as exc:
+                raise MailError(f"Cannot reach {IMAP_HOST}: {exc}") from exc
             try:
                 try:
                     conn.login(credentials.username, credentials.password)
@@ -230,7 +233,7 @@ class MailClient:
 
     def status(self) -> dict[str, Any]:
         credentials = load_credentials()
-        with self.connect() as conn:
+        with self.connect(credentials) as conn:
             _, data = conn.status("INBOX", "(MESSAGES UNSEEN)")
         counts = dict(re.findall(rb"(MESSAGES|UNSEEN) (\d+)", data[0]))
         return {
@@ -289,6 +292,7 @@ class MailClient:
         self, folder: str = "INBOX", limit: int = 20, offset: int = 0, unread_only: bool = False
     ) -> dict[str, Any]:
         limit = max(1, min(limit, 100))
+        offset = max(0, offset)
         with self.folder(folder) as conn:
             uids = self._search_uids(conn, ["UNSEEN" if unread_only else "ALL"], None)
             uids.sort(key=int, reverse=True)
@@ -528,8 +532,13 @@ class MailClient:
                     status, data = conn.uid("COPY", uid_set, target)
                     if status != "OK":
                         raise MailError(f"Copy failed: {data}")
-                    conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
-                    conn.uid("EXPUNGE", uid_set)
+                    status, data = conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
+                    if status == "OK":
+                        status, data = conn.uid("EXPUNGE", uid_set)
+                    if status != "OK":
+                        raise MailError(
+                            f"Copied to {destination!r} but could not remove from {source!r}: {data}"
+                        )
                 else:
                     raise MailError("Server supports neither MOVE nor UIDPLUS; cannot move safely.")
         return {"from": source, "to": destination, "moved": found, "not_found": missing}

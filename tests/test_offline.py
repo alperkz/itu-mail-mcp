@@ -98,7 +98,7 @@ def client(tmp_path, monkeypatch):
         yield conn
 
     monkeypatch.setattr(c, "folder", fake_folder)
-    monkeypatch.setattr(c, "connect", lambda: fake_folder("INBOX"))
+    monkeypatch.setattr(c, "connect", lambda credentials=None: fake_folder("INBOX"))
     c.conn = conn
     return c
 
@@ -222,3 +222,30 @@ def test_rename_folder(client):
     assert client.rename_folder("Çalı_ma", "Arşiv.Çalışma") == {"renamed": "Çalı_ma", "to": "Arşiv.Çalışma"}
     with pytest.raises(MailError):
         client.rename_folder("Çalı_ma", "Drafts")
+
+
+def test_list_messages_ignores_negative_offset(client):
+    assert [m["uid"] for m in client.list_messages(limit=1, offset=-1)["messages"]] == ["12"]
+
+
+def test_move_fallback_reports_failed_expunge(client, monkeypatch):
+    monkeypatch.setattr(client.conn, "capability", lambda: ("OK", [b"IMAP4rev1 UIDPLUS"]))
+    original = client.conn.uid
+
+    def uid(command, *args):
+        if command == "EXPUNGE":
+            return "NO", [b"nope"]
+        return original(command, *args)
+
+    monkeypatch.setattr(client.conn, "uid", uid)
+    with pytest.raises(MailError, match="could not remove"):
+        client.move_messages(["12"], "INBOX", "Drafts")
+
+
+def test_server_turns_connection_errors_into_error_dict():
+    from itu_mail_mcp import server
+
+    def boom():
+        raise TimeoutError("timed out")
+
+    assert "timed out" in server._run(boom)["error"]
